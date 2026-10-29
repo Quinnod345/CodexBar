@@ -73,7 +73,8 @@ actor ClaudeCLISession {
     private var primaryHandle: FileHandle?
     private var secondaryHandle: FileHandle?
     private var processGroup: pid_t?
-    private var ownedProcessGroups: Set<pid_t> = []
+    private var rootProcessIdentity: TTYProcessTreeTerminator.ProcessIdentity?
+    private var ownershipReaper: ProcessOwnershipReaper?
     private var sessionIdentity: SessionIdentity?
     private var startedAt: Date?
     private var launchedInProbeDirectory = false
@@ -344,8 +345,10 @@ actor ClaudeCLISession {
         proc.standardError = secondaryHandle
 
         proc.currentDirectoryURL = workingDirectory
+        let ownershipReaper = ProcessOwnershipReaper()
         var env = sessionIdentity.environment
         env["PWD"] = workingDirectory.path
+        env[ProcessOwnershipReaper.environmentKey] = ownershipReaper.marker
         proc.environment = env
 
         guard TTYCommandRunner.beginActiveProcessLaunchForAppShutdown() else {
@@ -390,7 +393,8 @@ actor ClaudeCLISession {
         self.primaryHandle = primaryHandle
         self.secondaryHandle = secondaryHandle
         self.processGroup = processGroup
-        self.ownedProcessGroups = processGroup.map { [$0] } ?? []
+        self.rootProcessIdentity = TTYProcessTreeTerminator.processIdentity(for: pid)
+        self.ownershipReaper = ownershipReaper
         self.sessionIdentity = sessionIdentity
         self.startedAt = Date()
         // Only the dedicated probe directory may be trusted, never `probeWorkingDirectoryURL()`'s temporary fallback.
@@ -474,31 +478,73 @@ actor ClaudeCLISession {
     }
 
     #if canImport(Darwin)
-    @discardableResult
-    private func refreshOwnedProcessGroups() -> Set<pid_t> {
-        let callerGroup = getpgrp()
-        if let group = self.processGroup, group > 1, group != callerGroup {
-            self.ownedProcessGroups.insert(group)
+    private func currentTreeIdentities() -> [TTYProcessTreeTerminator.ProcessIdentity] {
+        var identities = Set(self.ownershipReaper?.ownedProcessIdentities() ?? [])
+        guard let proc = self.process, proc.isRunning,
+              let rootIdentity = self.rootProcessIdentity ?? TTYProcessTreeTerminator.processIdentity(for: proc.processIdentifier),
+              TTYProcessTreeTerminator.isCurrent(rootIdentity)
+        else { return Array(identities) }
+        let rootPID = rootIdentity.pid
+        let treePIDs = Set([rootPID] + TTYProcessTreeTerminator.descendantPIDs(of: rootPID))
+        let uid = getuid()
+        for pid in treePIDs {
+            guard let info = DarwinProcessEnumerator.processInfo(pid: pid),
+                  info.pbi_uid == uid,
+                  pid == rootPID || treePIDs.contains(pid_t(info.pbi_ppid)),
+                  let identity = TTYProcessTreeTerminator.processIdentity(for: pid),
+                  TTYProcessTreeTerminator.isCurrent(identity)
+            else { continue }
+            identities.insert(identity)
         }
-        if let rootPID = self.process?.processIdentifier, rootPID > 0 {
-            for pid in [rootPID] + TTYProcessTreeTerminator.descendantPIDs(of: rootPID) {
-                let group = getpgid(pid)
-                if group > 1, group != callerGroup {
-                    self.ownedProcessGroups.insert(group)
-                }
+        return Array(identities)
+    }
+
+    private static func witnessedProcessGroups(
+        from identities: [TTYProcessTreeTerminator.ProcessIdentity]) -> Set<pid_t>
+    {
+        let callerGroup = getpgrp()
+        var groups: Set<pid_t> = []
+        for identity in identities where TTYProcessTreeTerminator.isCurrent(identity) {
+            let group = getpgid(identity.pid)
+            if group > 1, group != callerGroup, TTYProcessTreeTerminator.isCurrent(identity) {
+                groups.insert(group)
             }
         }
-        return self.ownedProcessGroups
+        return groups
+    }
+
+    private static func signalWitnessedInnerGroups(
+        witnesses: [TTYProcessTreeTerminator.ProcessIdentity],
+        excludingPrimaryGroup primaryGroup: pid_t?,
+        signal: Int32)
+    {
+        let callerGroup = getpgrp()
+        let groups = Self.witnessedProcessGroups(from: witnesses)
+        for group in groups where group > 1 && group != callerGroup && group != primaryGroup {
+            guard witnesses.contains(where: {
+                TTYProcessTreeTerminator.isCurrent($0) && getpgid($0.pid) == group
+            }) else { continue }
+            kill(-group, signal)
+        }
     }
     #endif
 
     private func releaseSleepInhibitors() {
         #if canImport(Darwin)
-        let groups = self.refreshOwnedProcessGroups()
+        let witnesses = self.currentTreeIdentities()
+        let groups = Self.witnessedProcessGroups(from: witnesses)
         guard !groups.isEmpty else { return }
+        let witnessPIDs = Set(witnesses.map(\.pid))
+        let uid = getuid()
         for pid in DarwinProcessEnumerator.allPIDs() where groups.contains(getpgid(pid)) {
-            guard DarwinProcessEnumerator.executablePath(pid: pid) == "/usr/bin/caffeinate",
-                  groups.contains(getpgid(pid)) else { continue }
+            guard let identity = TTYProcessTreeTerminator.processIdentity(for: pid),
+                  let info = DarwinProcessEnumerator.processInfo(pid: pid),
+                  info.pbi_uid == uid,
+                  witnessPIDs.contains(pid_t(info.pbi_ppid)),
+                  DarwinProcessEnumerator.executablePath(pid: pid) == "/usr/bin/caffeinate",
+                  TTYProcessTreeTerminator.isCurrent(identity),
+                  Self.witnessedProcessGroups(from: witnesses).contains(getpgid(pid))
+            else { continue }
             kill(pid, SIGTERM)
         }
         #endif
@@ -506,8 +552,9 @@ actor ClaudeCLISession {
 
     private func cleanup() {
         self.releaseSleepInhibitors()
+        let ownershipReaper = self.ownershipReaper
         #if canImport(Darwin)
-        let ownedGroups = self.ownedProcessGroups
+        let treeWitnesses = self.currentTreeIdentities()
         #endif
         if self.process != nil {
             Self.log.debug("Claude CLI session stopping")
@@ -519,6 +566,7 @@ actor ClaudeCLISession {
         try? self.secondaryHandle?.close()
 
         let descendants = self.process.map { TTYProcessTreeTerminator.descendantPIDs(of: $0.processIdentifier) } ?? []
+        let descendantIdentities = descendants.compactMap { TTYProcessTreeTerminator.processIdentity(for: $0) }
         if let proc = self.process, proc.isRunning {
             proc.terminate()
         }
@@ -527,12 +575,12 @@ actor ClaudeCLISession {
                 rootPID: proc.processIdentifier,
                 processGroup: self.processGroup,
                 signal: SIGTERM,
-                knownDescendants: descendants)
+                knownDescendants: descendantIdentities.filter(TTYProcessTreeTerminator.isCurrent).map(\.pid))
             #if canImport(Darwin)
-            let callerGroup = getpgrp()
-            for group in ownedGroups where group > 1 && group != callerGroup && group != self.processGroup {
-                kill(-group, SIGTERM)
-            }
+            Self.signalWitnessedInnerGroups(
+                witnesses: treeWitnesses,
+                excludingPrimaryGroup: self.processGroup,
+                signal: SIGTERM)
             #endif
         }
         let waitDeadline = Date().addingTimeInterval(1.0)
@@ -540,25 +588,29 @@ actor ClaudeCLISession {
             while proc.isRunning, Date() < waitDeadline {
                 usleep(100_000)
             }
+            let liveDescendants = descendantIdentities.filter(TTYProcessTreeTerminator.isCurrent).map(\.pid)
             if proc.isRunning {
                 TTYProcessTreeTerminator.terminateProcessTree(
                     rootPID: proc.processIdentifier,
                     processGroup: self.processGroup,
                     signal: SIGKILL,
-                    knownDescendants: descendants)
+                    knownDescendants: liveDescendants)
             } else {
-                for pid in descendants where pid > 0 {
+                for pid in liveDescendants where pid > 0 {
                     kill(pid, SIGKILL)
                 }
             }
             #if canImport(Darwin)
-            let callerGroup = getpgrp()
-            for group in ownedGroups where group > 1 && group != callerGroup && group != self.processGroup {
-                kill(-group, SIGKILL)
-            }
+            Self.signalWitnessedInnerGroups(
+                witnesses: treeWitnesses,
+                excludingPrimaryGroup: self.processGroup,
+                signal: SIGKILL)
             #endif
+            ownershipReaper?.reap(processGroup: self.processGroup)
             TTYCommandRunner.unregisterActiveProcessForAppShutdown(pid: proc.processIdentifier)
             ProcessExitRelease.afterExit(proc)
+        } else {
+            ownershipReaper?.reap(processGroup: self.processGroup)
         }
 
         self.process = nil
@@ -566,7 +618,8 @@ actor ClaudeCLISession {
         self.secondaryHandle = nil
         self.primaryFD = -1
         self.processGroup = nil
-        self.ownedProcessGroups.removeAll()
+        self.rootProcessIdentity = nil
+        self.ownershipReaper = nil
         self.sessionIdentity = nil
         self.startedAt = nil
         self.launchedInProbeDirectory = false

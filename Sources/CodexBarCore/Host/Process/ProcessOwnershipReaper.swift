@@ -14,9 +14,7 @@ struct ProcessOwnershipReaper: Sendable {
 
     func reap(processGroup: pid_t? = nil) {
         // A live marked member must still witness group ownership after the leader exits.
-        if let processGroup {
-            self.signalGroup(processGroup, signal: SIGTERM)
-        }
+        self.signalOwnedGroups(signal: SIGTERM, primaryGroup: processGroup)
         let deadline = Date().addingTimeInterval(0.4)
         repeat {
             let identities = self.ownedProcesses()
@@ -26,11 +24,23 @@ struct ProcessOwnershipReaper: Sendable {
             }
             usleep(50000)
         } while Date() < deadline
-        if let processGroup {
-            self.signalGroup(processGroup, signal: SIGKILL)
-        }
+        self.signalOwnedGroups(signal: SIGKILL, primaryGroup: processGroup)
         for identity in self.ownedProcesses() {
             Self.signal(identity, SIGKILL, owns: self.owns)
+        }
+    }
+
+    func ownedProcessIdentities() -> [TTYProcessTreeTerminator.ProcessIdentity] {
+        self.ownedProcesses()
+    }
+
+    private func signalOwnedGroups(signal: Int32, primaryGroup: pid_t?) {
+        var groups = Set(self.ownedProcesses().map { getpgid($0.pid) })
+        if let primaryGroup {
+            groups.insert(primaryGroup)
+        }
+        for group in groups {
+            self.signalGroup(group, signal: signal)
         }
     }
 
