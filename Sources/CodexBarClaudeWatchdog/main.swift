@@ -63,6 +63,18 @@ guard !childArgs.isEmpty else { usageAndExit() }
 let childBinary = childArgs[0]
 let childArgv = childArgs
 
+private func handleTerminationSignal(_ sig: Int32) {
+    globalShouldTerminate = sig
+}
+
+var watchdogSignalMask = sigset_t()
+sigemptyset(&watchdogSignalMask)
+_ = sigprocmask(SIG_SETMASK, &watchdogSignalMask, nil)
+
+signal(SIGTERM, handleTerminationSignal)
+signal(SIGINT, handleTerminationSignal)
+signal(SIGHUP, handleTerminationSignal)
+
 let spawnResult: Int32 = childArgv.withUnsafeBufferPointer { buffer in
     var cStrings: [UnsafeMutablePointer<CChar>?] = buffer
         .map { strdup($0) }
@@ -75,9 +87,16 @@ let spawnResult: Int32 = childArgv.withUnsafeBufferPointer { buffer in
     }
     defer { posix_spawnattr_destroy(&attributes) }
 
-    guard posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETPGROUP)) == 0,
-          posix_spawnattr_setpgroup(&attributes, 0) == 0
+    guard posix_spawnattr_setflags(
+        &attributes,
+        Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGMASK)) == 0,
+        posix_spawnattr_setpgroup(&attributes, 0) == 0
     else {
+        return EINVAL
+    }
+    var emptyMask = sigset_t()
+    sigemptyset(&emptyMask)
+    guard posix_spawnattr_setsigmask(&attributes, &emptyMask) == 0 else {
         return EINVAL
     }
 
@@ -107,14 +126,6 @@ private func terminateChild() -> Int32? {
     }
     return nil
 }
-
-private func handleTerminationSignal(_ sig: Int32) {
-    globalShouldTerminate = sig
-}
-
-signal(SIGTERM, handleTerminationSignal)
-signal(SIGINT, handleTerminationSignal)
-signal(SIGHUP, handleTerminationSignal)
 
 var status: Int32 = 0
 while true {

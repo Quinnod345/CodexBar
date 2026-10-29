@@ -73,6 +73,7 @@ actor ClaudeCLISession {
     private var primaryHandle: FileHandle?
     private var secondaryHandle: FileHandle?
     private var processGroup: pid_t?
+    private var ownedProcessGroups: Set<pid_t> = []
     private var sessionIdentity: SessionIdentity?
     private var startedAt: Date?
     private var launchedInProbeDirectory = false
@@ -328,7 +329,9 @@ actor ClaudeCLISession {
         let disableWatchdog = sessionIdentity.environment["CODEXBAR_DISABLE_CLAUDE_WATCHDOG"] == "1"
         if !disableWatchdog,
            resolvedURL.lastPathComponent == "claude",
-           let watchdog = TTYCommandRunner.locateBundledHelper("CodexBarClaudeWatchdog")
+           let watchdog = TTYCommandRunner.locateBundledHelper(
+               "CodexBarClaudeWatchdog",
+               environment: sessionIdentity.environment)
         {
             proc.executableURL = URL(fileURLWithPath: watchdog)
             proc.arguments = ["--", request.binary] + claudeArguments
@@ -387,6 +390,7 @@ actor ClaudeCLISession {
         self.primaryHandle = primaryHandle
         self.secondaryHandle = secondaryHandle
         self.processGroup = processGroup
+        self.ownedProcessGroups = processGroup.map { [$0] } ?? []
         self.sessionIdentity = sessionIdentity
         self.startedAt = Date()
         // Only the dedicated probe directory may be trusted, never `probeWorkingDirectoryURL()`'s temporary fallback.
@@ -469,12 +473,32 @@ actor ClaudeCLISession {
         return env
     }
 
+    #if canImport(Darwin)
+    @discardableResult
+    private func refreshOwnedProcessGroups() -> Set<pid_t> {
+        let callerGroup = getpgrp()
+        if let group = self.processGroup, group > 1, group != callerGroup {
+            self.ownedProcessGroups.insert(group)
+        }
+        if let rootPID = self.process?.processIdentifier, rootPID > 0 {
+            for pid in [rootPID] + TTYProcessTreeTerminator.descendantPIDs(of: rootPID) {
+                let group = getpgid(pid)
+                if group > 1, group != callerGroup {
+                    self.ownedProcessGroups.insert(group)
+                }
+            }
+        }
+        return self.ownedProcessGroups
+    }
+    #endif
+
     private func releaseSleepInhibitors() {
         #if canImport(Darwin)
-        guard let group = self.processGroup, group > 1 else { return }
-        for pid in DarwinProcessEnumerator.allPIDs() where getpgid(pid) == group {
+        let groups = self.refreshOwnedProcessGroups()
+        guard !groups.isEmpty else { return }
+        for pid in DarwinProcessEnumerator.allPIDs() where groups.contains(getpgid(pid)) {
             guard DarwinProcessEnumerator.executablePath(pid: pid) == "/usr/bin/caffeinate",
-                  getpgid(pid) == group else { continue }
+                  groups.contains(getpgid(pid)) else { continue }
             kill(pid, SIGTERM)
         }
         #endif
@@ -482,6 +506,9 @@ actor ClaudeCLISession {
 
     private func cleanup() {
         self.releaseSleepInhibitors()
+        #if canImport(Darwin)
+        let ownedGroups = self.ownedProcessGroups
+        #endif
         if self.process != nil {
             Self.log.debug("Claude CLI session stopping")
         }
@@ -501,6 +528,12 @@ actor ClaudeCLISession {
                 processGroup: self.processGroup,
                 signal: SIGTERM,
                 knownDescendants: descendants)
+            #if canImport(Darwin)
+            let callerGroup = getpgrp()
+            for group in ownedGroups where group > 1 && group != callerGroup && group != self.processGroup {
+                kill(-group, SIGTERM)
+            }
+            #endif
         }
         let waitDeadline = Date().addingTimeInterval(1.0)
         if let proc = self.process {
@@ -518,6 +551,12 @@ actor ClaudeCLISession {
                     kill(pid, SIGKILL)
                 }
             }
+            #if canImport(Darwin)
+            let callerGroup = getpgrp()
+            for group in ownedGroups where group > 1 && group != callerGroup && group != self.processGroup {
+                kill(-group, SIGKILL)
+            }
+            #endif
             TTYCommandRunner.unregisterActiveProcessForAppShutdown(pid: proc.processIdentifier)
             ProcessExitRelease.afterExit(proc)
         }
@@ -527,6 +566,7 @@ actor ClaudeCLISession {
         self.secondaryHandle = nil
         self.primaryFD = -1
         self.processGroup = nil
+        self.ownedProcessGroups.removeAll()
         self.sessionIdentity = nil
         self.startedAt = nil
         self.launchedInProbeDirectory = false
