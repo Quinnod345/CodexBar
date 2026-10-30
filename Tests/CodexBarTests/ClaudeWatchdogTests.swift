@@ -221,5 +221,94 @@ struct ClaudeWatchdogTests {
         }
         #expect(kill(childPID, 0) != 0)
     }
+
+    @Test
+    func `watchdog confines SIGKILL escalation to spawn-owned group when direct child joins external group during grace`() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codexbar-watchdog-kill-scope-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let watchdogURL = try Self.buildWatchdogExecutable(in: directory)
+        let sentinel = Process()
+        sentinel.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        sentinel.arguments = ["30"]
+        try sentinel.run()
+        let sentinelPID = sentinel.processIdentifier
+        #expect(setpgid(sentinelPID, sentinelPID) == 0 || getpgid(sentinelPID) == sentinelPID)
+        defer {
+            if sentinel.isRunning { sentinel.terminate() }
+            sentinel.waitUntilExit()
+        }
+
+        let readyFile = directory.appendingPathComponent("ready.txt")
+        let switchedFile = directory.appendingPathComponent("switched.txt")
+        let childScript = directory.appendingPathComponent("child.py")
+        try """
+        #!/usr/bin/python3
+        import os, signal, subprocess, sys, time
+
+        target_pgid = int(sys.argv[1])
+        ready_path = sys.argv[2]
+        switched_path = sys.argv[3]
+
+        grandchild = subprocess.Popen(["/bin/sleep", "30"])
+
+        def on_term(signum, frame):
+            os.setpgid(0, target_pgid)
+            with open(switched_path, "w") as f:
+                f.write(f"{os.getpid()} {os.getpgrp()}\\n")
+
+        signal.signal(signal.SIGTERM, on_term)
+        with open(ready_path, "w") as f:
+            f.write(f"{os.getpid()} {os.getpgrp()} {grandchild.pid}\\n")
+
+        deadline = time.time() + 30.0
+        while time.time() < deadline:
+            time.sleep(0.05)
+        """.write(to: childScript, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: childScript.path)
+
+        let watchdog = Process()
+        watchdog.executableURL = watchdogURL
+        watchdog.arguments = ["--", childScript.path, "\(sentinelPID)", readyFile.path, switchedFile.path]
+        try watchdog.run()
+        defer {
+            if watchdog.isRunning { watchdog.terminate() }
+        }
+
+        let startDeadline = Date().addingTimeInterval(5)
+        while !FileManager.default.fileExists(atPath: readyFile.path), Date() < startDeadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+
+        let readyParts = try String(contentsOf: readyFile, encoding: .utf8)
+            .split(whereSeparator: \.isWhitespace)
+            .compactMap { pid_t($0) }
+        #expect(readyParts.count == 3)
+        let childPID = try #require(readyParts.first)
+        let initialChildPGID = try #require(readyParts.dropFirst().first)
+        let grandchildPID = try #require(readyParts.last)
+        #expect(initialChildPGID == childPID)
+        #expect(initialChildPGID != sentinelPID)
+
+        #expect(kill(watchdog.processIdentifier, SIGTERM) == 0)
+        watchdog.waitUntilExit()
+        #expect(watchdog.terminationStatus == 143)
+
+        let switchedParts = try String(contentsOf: switchedFile, encoding: .utf8)
+            .split(whereSeparator: \.isWhitespace)
+            .compactMap { pid_t($0) }
+        #expect(switchedParts == [childPID, sentinelPID])
+
+        let stopDeadline = Date().addingTimeInterval(2)
+        while (kill(childPID, 0) == 0 || kill(grandchildPID, 0) == 0) && Date() < stopDeadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(kill(childPID, 0) != 0)
+        #expect(kill(grandchildPID, 0) != 0)
+        #expect(sentinel.isRunning)
+        #expect(kill(sentinelPID, 0) == 0)
+    }
 }
 #endif

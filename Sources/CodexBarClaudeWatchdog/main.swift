@@ -17,11 +17,13 @@ private func usageAndExit() -> Never {
 @discardableResult
 private func killProcessTree(childPID: pid_t, graceSeconds: TimeInterval = 0.5) -> Int32? {
     let selfPgrp = getpgrp()
-    let pgid = getpgid(childPID)
-    if pgid > 0, pgid != selfPgrp {
-        kill(-pgid, SIGTERM)
-    } else {
-        kill(childPID, SIGTERM)
+    let spawnedGroup = childPID
+    let initialPgid = getpgid(childPID)
+    if spawnedGroup > 0, spawnedGroup != selfPgrp {
+        _ = kill(-spawnedGroup, SIGTERM)
+    }
+    if initialPgid != spawnedGroup {
+        _ = kill(childPID, SIGTERM)
     }
 
     let deadline = Date().addingTimeInterval(graceSeconds)
@@ -33,10 +35,11 @@ private func killProcessTree(childPID: pid_t, graceSeconds: TimeInterval = 0.5) 
     }
 
     let currentPgid = getpgid(childPID)
-    if currentPgid > 0, currentPgid != selfPgrp {
-        kill(-currentPgid, SIGKILL)
-    } else if currentPgid == selfPgrp || currentPgid < 0 {
-        kill(childPID, SIGKILL)
+    if spawnedGroup > 0, spawnedGroup != selfPgrp {
+        _ = kill(-spawnedGroup, SIGKILL)
+    }
+    if currentPgid != spawnedGroup {
+        _ = kill(childPID, SIGKILL)
     }
     return nil
 }
