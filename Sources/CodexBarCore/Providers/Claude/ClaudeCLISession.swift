@@ -481,7 +481,7 @@ actor ClaudeCLISession {
     private func currentLiveTreeIdentities() -> Set<TTYProcessTreeTerminator.ProcessIdentity> {
         guard let proc = self.process, proc.isRunning,
               let rootIdentity = self.rootProcessIdentity
-                  ?? TTYProcessTreeTerminator.processIdentity(for: proc.processIdentifier),
+              ?? TTYProcessTreeTerminator.processIdentity(for: proc.processIdentifier),
               TTYProcessTreeTerminator.isCurrent(rootIdentity)
         else { return [] }
         let rootPID = rootIdentity.pid

@@ -14,7 +14,6 @@ private func usageAndExit() -> Never {
     Darwin.exit(WatchdogExitCode.usage)
 }
 
-@discardableResult
 private func killProcessTree(childPID: pid_t, graceSeconds: TimeInterval = 0.5) -> Int32? {
     let selfPgrp = getpgrp()
     let spawnedGroup = childPID
@@ -120,16 +119,6 @@ guard spawnResult == 0, globalChildPID > 0 else {
     Darwin.exit(WatchdogExitCode.spawnFailed)
 }
 
-_ = setpgid(globalChildPID, globalChildPID)
-
-@discardableResult
-private func terminateChild() -> Int32? {
-    if globalChildPID > 0 {
-        return killProcessTree(childPID: globalChildPID)
-    }
-    return nil
-}
-
 var status: Int32 = 0
 while true {
     let rc = waitpid(globalChildPID, &status, WNOHANG)
@@ -137,23 +126,15 @@ while true {
         Darwin.exit(exitCode(fromWaitStatus: status))
     }
 
-    if globalShouldTerminate != 0 {
-        let sig = globalShouldTerminate
-        if let reapedStatus = terminateChild() {
+    if globalShouldTerminate != 0 || getppid() == 1 {
+        let terminationSignal = globalShouldTerminate
+        if let reapedStatus = killProcessTree(childPID: globalChildPID) {
             status = reapedStatus
         } else {
             _ = waitpid(globalChildPID, &status, 0)
         }
-        Darwin.exit(128 + sig)
-    }
-
-    if getppid() == 1 {
-        if let reapedStatus = terminateChild() {
-            status = reapedStatus
-        } else {
-            _ = waitpid(globalChildPID, &status, 0)
-        }
-        Darwin.exit(exitCode(fromWaitStatus: status))
+        let code = terminationSignal == 0 ? exitCode(fromWaitStatus: status) : 128 + terminationSignal
+        Darwin.exit(code)
     }
 
     usleep(200_000)
